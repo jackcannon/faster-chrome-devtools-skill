@@ -26,6 +26,8 @@ npx skills add zeke/faster-chrome-devtools-skill
 
 - The canonical sub-100ms interaction loop: `click` → `wait_for` → `fill` → `wait_for`
 
+- When to skip browser sessions entirely and use [Browser Run Quick Actions](https://developers.cloudflare.com/browser-run/quick-actions/) from a Worker with `env.BROWSER.quickAction()` for one-shot screenshots, PDFs, rendered HTML, Markdown, JSON extraction, scraping, links, snapshots, and crawls. The skill covers the required browser binding and `compatibility_date` of `2026-03-24` or later.
+
 - Driving [Cloudflare Browser Rendering](https://developers.cloudflare.com/browser-run/cdp/mcp-clients/) as a remote target: the same `chrome-devtools-mcp` package pointed at a CDP WebSocket gives you a clean, anonymous Chromium in the cloud. The skill documents when to prefer it over your local Chrome and the quirks to know (`resize_page` is unsupported, default viewport is tiny, `navigator.clipboard` hangs, headless UA may be detected).
 
 ## How it was made

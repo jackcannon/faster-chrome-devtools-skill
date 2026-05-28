@@ -6,8 +6,9 @@ description: >
   tool — take_snapshot, take_screenshot, navigate_page, wait_for, click, fill,
   new_page, list_pages, select_page, or evaluate_script. Covers screenshot size
   limits that can permanently kill sessions, navigation timeout pitfalls, the
-  fastest patterns for common browser automation tasks, and the quirks of
-  driving Cloudflare Browser Rendering (chrome-devtools-cf) as a remote target.
+  fastest patterns for common browser automation tasks, Browser Run Quick
+  Actions from Workers, and the quirks of driving Cloudflare Browser Rendering
+  (chrome-devtools-cf) as a remote target.
 ---
 
 # Chrome DevTools MCP: faster patterns
@@ -181,6 +182,52 @@ wait_for({ text: ["Order confirmed"], timeout: 5000 })    // ~55ms
 | `new_page()` when tab is already open     | `list_pages()` then `select_page()`                                |
 | Long `wait_for` for async external events | `evaluate_script` polling a JS condition                           |
 | Clicking into React components via a11y   | `evaluate_script` with direct DOM manipulation                     |
+| Browser Run REST API fetch from a Worker  | `env.BROWSER.quickAction(...)` with a browser binding              |
+| CDP session for one-shot scrape/PDF work  | Browser Run Quick Actions                                          |
+
+## Browser Run Quick Actions from Workers
+
+If the task is a stateless browser output from a URL or HTML string, and you are already writing a Cloudflare Worker, use Browser Run Quick Actions through the browser binding instead of Chrome DevTools MCP, CDP, Puppeteer, Playwright, or a REST API call.
+
+Workers can call Quick Actions directly with `env.BROWSER.quickAction(action, options)`. This avoids API tokens, avoids external HTTP requests, and keeps the call on Cloudflare's network.
+
+Use Quick Actions for:
+
+- Screenshots: `"screenshot"`
+- PDFs: `"pdf"`
+- Rendered HTML: `"content"`
+- Markdown extraction: `"markdown"`
+- AI structured JSON extraction: `"json"`
+- CSS selector scraping: `"scrape"`
+- Link extraction: `"links"`
+- Combined HTML and screenshot capture: `"snapshot"`
+- Crawling: `"crawl"`
+
+Required Worker configuration:
+
+```jsonc
+{
+  "compatibility_date": "2026-03-24",
+  "browser": {
+    "binding": "BROWSER"
+  }
+}
+```
+
+Example:
+
+```js
+const screenshot = await env.BROWSER.quickAction("screenshot", {
+  url: "https://www.cloudflare.com/",
+});
+```
+
+Decision rule:
+
+- Need one output from one rendered page: use `quickAction()`.
+- Need login state, multi-step clicks, DOM mutation, debugging an active tab, or visual inspection by the agent: use Chrome DevTools MCP or a browser session.
+- Need browser automation inside a Worker that cannot be expressed as a Quick Action: use Browser Run with Puppeteer, Playwright, or CDP.
+- Never add a `fetch()` call to the Browser Run REST API from a Worker just to call Quick Actions. Use the binding.
 
 ## Cloudflare Browser Rendering (chrome-devtools-cf)
 

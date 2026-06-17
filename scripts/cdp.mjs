@@ -1,0 +1,722 @@
+#!/usr/bin/env node
+// Dependency-free Chrome DevTools Protocol CLI for Node.js 22+.
+
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir, platform, tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import net from 'node:net';
+import { fileURLToPath } from 'node:url';
+import { connectWebSocket } from './lib/websocket.mjs';
+
+const SCRIPT = fileURLToPath(import.meta.url);
+const DEFAULT_TIMEOUT = 15_000;
+const IDLE_TIMEOUT = 20 * 60_000;
+const MIN_PREFIX = 8;
+const STATE_PREFIX = 'faster-cdp-';
+const VERSION = '0.1.0';
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function parseOptions(argv) {
+  const options = {
+    wsEndpoint: process.env.CDP_WS_ENDPOINT,
+    httpEndpoint: process.env.CDP_HTTP_ENDPOINT,
+    headers: process.env.CDP_HEADERS ? JSON.parse(process.env.CDP_HEADERS) : {},
+    timeout: DEFAULT_TIMEOUT,
+  };
+  const args = [];
+  for (let i = 0; i < argv.length; i++) {
+    const value = argv[i];
+    if (value === '--ws-endpoint') options.wsEndpoint = argv[++i];
+    else if (value === '--http-endpoint') options.httpEndpoint = argv[++i];
+    else if (value === '--headers') options.headers = JSON.parse(argv[++i]);
+    else if (value === '--timeout') options.timeout = positiveInteger(argv[++i], '--timeout');
+    else if (value === '--help' || value === '-h') options.help = true;
+    else if (value === '--version' || value === '-v') options.version = true;
+    else args.push(value);
+  }
+  return { options, args };
+}
+
+function positiveInteger(value, name) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
+  return number;
+}
+
+function activePortCandidates() {
+  const home = homedir();
+  if (platform() === 'darwin') {
+    return [join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort')];
+  }
+  if (platform() === 'win32') {
+    const local = process.env.LOCALAPPDATA;
+    return local ? [join(local, 'Google/Chrome/User Data/DevToolsActivePort')] : [];
+  }
+  return [
+    join(home, '.config/google-chrome/DevToolsActivePort'),
+    join(home, '.config/google-chrome-beta/DevToolsActivePort'),
+    join(home, '.config/chromium/DevToolsActivePort'),
+  ];
+}
+
+async function endpointFromHttp(httpEndpoint, headers, timeout) {
+  const base = httpEndpoint.replace(/\/$/, '');
+  const response = await fetch(`${base}/json/version`, {
+    headers,
+    signal: AbortSignal.timeout(timeout),
+  });
+  if (!response.ok) throw new Error(`CDP discovery failed: HTTP ${response.status}`);
+  const info = await response.json();
+  if (!info.webSocketDebuggerUrl) throw new Error('CDP discovery response has no webSocketDebuggerUrl');
+  return info.webSocketDebuggerUrl;
+}
+
+async function resolveEndpoint(options) {
+  if (options.wsEndpoint) return options.wsEndpoint;
+  if (options.httpEndpoint) return endpointFromHttp(options.httpEndpoint, options.headers, options.timeout);
+
+  for (const path of activePortCandidates()) {
+    if (!existsSync(path)) continue;
+    const [port, browserPath] = readFileSync(path, 'utf8').trim().split(/\r?\n/);
+    if (port && browserPath) return `ws://127.0.0.1:${port}${browserPath}`;
+  }
+
+  try {
+    return await endpointFromHttp('http://127.0.0.1:9222', options.headers, 1_000);
+  } catch {}
+  throw new Error([
+    'Could not find Chrome\'s CDP endpoint.',
+    'Enable remote debugging at chrome://inspect/#remote-debugging,',
+    'or pass --ws-endpoint / --http-endpoint.',
+  ].join(' '));
+}
+
+class CDP {
+  #connection;
+  #id = 0;
+  #pending = new Map();
+  #eventHandlers = new Map();
+  #closeHandlers = new Set();
+  #defaultTimeout;
+
+  constructor(defaultTimeout) { this.#defaultTimeout = defaultTimeout; }
+
+  async connect(endpoint, headers) {
+    this.#connection = await connectWebSocket(endpoint, headers, this.#defaultTimeout);
+    this.#connection.onMessage(text => {
+      const message = JSON.parse(text);
+      if (message.id && this.#pending.has(message.id)) {
+        const pending = this.#pending.get(message.id);
+        this.#pending.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.error) pending.reject(new Error(message.error.message));
+        else pending.resolve(message.result);
+      } else if (message.method) {
+        for (const handler of this.#eventHandlers.get(message.method) || []) handler(message.params || {}, message);
+      }
+    });
+    this.#connection.onClose(error => {
+      for (const pending of this.#pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(error || new Error('Chrome closed the CDP connection'));
+      }
+      this.#pending.clear();
+      for (const handler of this.#closeHandlers) handler(error);
+    });
+  }
+
+  send(method, params = {}, sessionId, timeout = this.#defaultTimeout) {
+    const id = ++this.#id;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.#pending.delete(id)) return;
+        reject(new Error(`Timed out after ${timeout}ms: ${method}`));
+      }, timeout);
+      this.#pending.set(id, { resolve, reject, timer });
+      const message = { id, method, params };
+      if (sessionId) message.sessionId = sessionId;
+      this.#connection.sendText(JSON.stringify(message));
+    });
+  }
+
+  on(method, handler) {
+    if (!this.#eventHandlers.has(method)) this.#eventHandlers.set(method, new Set());
+    const handlers = this.#eventHandlers.get(method);
+    handlers.add(handler);
+    return () => handlers.delete(handler);
+  }
+
+  waitForEvent(method, sessionId, timeout = this.#defaultTimeout) {
+    let settled = false;
+    let timer;
+    let off;
+    const promise = new Promise((resolve, reject) => {
+      off = this.on(method, (params, message) => {
+        if (settled || (sessionId && message.sessionId !== sessionId)) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+        resolve(params);
+      });
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        off();
+        reject(new Error(`Timed out after ${timeout}ms waiting for ${method}`));
+      }, timeout);
+    });
+    return {
+      promise,
+      cancel() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+      },
+    };
+  }
+
+  onClose(handler) { this.#closeHandlers.add(handler); }
+  close() { this.#connection?.close(); }
+}
+
+async function pages(cdp) {
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  return targetInfos.filter(target => target.type === 'page' && !target.url.startsWith('chrome://'));
+}
+
+function uniquePrefixLength(ids) {
+  for (let length = MIN_PREFIX; length <= Math.max(MIN_PREFIX, ...ids.map(id => id.length)); length++) {
+    if (new Set(ids.map(id => id.slice(0, length).toUpperCase())).size === ids.length) return length;
+  }
+  return Math.max(MIN_PREFIX, ...ids.map(id => id.length));
+}
+
+function formatPages(items) {
+  const length = uniquePrefixLength(items.map(item => item.targetId));
+  return items.map(item => `${item.targetId.slice(0, length).padEnd(length)}  ${item.title.slice(0, 54).padEnd(54)}  ${item.url}`).join('\n');
+}
+
+function resolveTarget(prefix, items) {
+  if (!prefix) throw new Error('Target ID required. Run `cdp list` first.');
+  const matches = items.filter(item => item.targetId.toUpperCase().startsWith(prefix.toUpperCase()));
+  if (!matches.length) throw new Error(`No page matches target prefix "${prefix}". Run \`cdp list\` again.`);
+  if (matches.length > 1) throw new Error(`Target prefix "${prefix}" is ambiguous; use more characters.`);
+  return matches[0];
+}
+
+function axVisible(node) {
+  const role = node.role?.value || '';
+  const name = node.name?.value ?? '';
+  const value = node.value?.value;
+  return role !== 'none' && role !== 'generic' && role !== 'InlineTextBox' && (name !== '' || (value !== '' && value != null));
+}
+
+function formatSnapshot(nodes) {
+  const byId = new Map(nodes.map(node => [node.nodeId, node]));
+  const childrenByParent = new Map();
+  for (const node of nodes) {
+    if (!node.parentId) continue;
+    if (!childrenByParent.has(node.parentId)) childrenByParent.set(node.parentId, []);
+    childrenByParent.get(node.parentId).push(node);
+  }
+  const output = [];
+  const visited = new Set();
+  const visit = (node, depth) => {
+    if (!node || visited.has(node.nodeId)) return;
+    visited.add(node.nodeId);
+    if (axVisible(node)) {
+      const role = node.role?.value || 'unknown';
+      const ref = node.backendDOMNodeId ? ` ref=${node.backendDOMNodeId}` : '';
+      const name = node.name?.value ? ` ${JSON.stringify(node.name.value)}` : '';
+      const value = node.value?.value;
+      output.push(`${'  '.repeat(Math.min(depth, 10))}[${role}${ref}]${name}${value == null || value === '' ? '' : ` value=${JSON.stringify(value)}`}`);
+    }
+    const childIds = [...(node.childIds || [])];
+    for (const child of childrenByParent.get(node.nodeId) || []) {
+      if (!childIds.includes(child.nodeId)) childIds.push(child.nodeId);
+    }
+    for (const childId of childIds) visit(byId.get(childId), depth + 1);
+  };
+  for (const node of nodes.filter(node => !node.parentId || !byId.has(node.parentId))) visit(node, 0);
+  for (const node of nodes) visit(node, 0);
+  return output.join('\n');
+}
+
+async function evaluate(cdp, sid, expression, timeout) {
+  const result = await cdp.send('Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+    userGesture: true,
+  }, sid, timeout);
+  if (result.exceptionDetails) {
+    throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'JavaScript evaluation failed');
+  }
+  const value = result.result.value;
+  return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '');
+}
+
+async function objectForRef(cdp, sid, ref) {
+  const backendNodeId = Number(String(ref).replace(/^ref:/, ''));
+  if (!Number.isInteger(backendNodeId)) throw new Error('Expected an accessibility ref such as ref:123');
+  const { object } = await cdp.send('DOM.resolveNode', { backendNodeId }, sid);
+  if (!object?.objectId) throw new Error(`Could not resolve ref:${backendNodeId}`);
+  return object.objectId;
+}
+
+async function callOnRef(cdp, sid, ref, functionDeclaration, args = []) {
+  const objectId = await objectForRef(cdp, sid, ref);
+  const result = await cdp.send('Runtime.callFunctionOn', {
+    objectId,
+    functionDeclaration,
+    arguments: args.map(value => ({ value })),
+    awaitPromise: true,
+    returnByValue: true,
+    userGesture: true,
+  }, sid);
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || 'Element interaction failed');
+  return result.result.value;
+}
+
+function parseSelectorOrRef(value) {
+  if (!value) throw new Error('A selector or ref is required');
+  return /^ref:\d+$/.test(value) ? { ref: value } : { selector: value };
+}
+
+async function backendNodeForTarget(cdp, sid, target) {
+  const parsed = parseSelectorOrRef(target);
+  if (parsed.ref) return Number(parsed.ref.slice(4));
+  const result = await cdp.send('Runtime.evaluate', {
+    expression: `document.querySelector(${JSON.stringify(parsed.selector)})`,
+    returnByValue: false,
+  }, sid);
+  if (!result.result?.objectId || result.result.subtype === 'null') {
+    throw new Error(`Element not found: ${parsed.selector}`);
+  }
+  try {
+    const { node } = await cdp.send('DOM.describeNode', { objectId: result.result.objectId }, sid);
+    return node.backendNodeId;
+  } finally {
+    await cdp.send('Runtime.releaseObject', { objectId: result.result.objectId }, sid).catch(() => {});
+  }
+}
+
+async function clickElement(cdp, sid, target) {
+  const backendNodeId = await backendNodeForTarget(cdp, sid, target);
+  let model;
+  try {
+    await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId }, sid);
+    ({ model } = await cdp.send('DOM.getBoxModel', { backendNodeId }, sid));
+  } catch {
+    await callOnRef(cdp, sid, `ref:${backendNodeId}`, `function () { this.click(); }`);
+    return 'element through DOM fallback';
+  }
+  const quad = model.border || model.content;
+  const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+  const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+  const event = { x, y, button: 'left', clickCount: 1 };
+  await cdp.send('Input.dispatchMouseEvent', { ...event, type: 'mouseMoved' }, sid);
+  await cdp.send('Input.dispatchMouseEvent', { ...event, type: 'mousePressed' }, sid);
+  await cdp.send('Input.dispatchMouseEvent', { ...event, type: 'mouseReleased' }, sid);
+  return `element at (${Math.round(x)}, ${Math.round(y)})`;
+}
+
+const SET_VALUE = `function (value) {
+  this.scrollIntoView({block:'center'}); this.focus();
+  const prototype = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+  if (setter) setter.call(this, value); else this.value = value;
+  this.dispatchEvent(new Event('input', {bubbles:true}));
+  this.dispatchEvent(new Event('change', {bubbles:true}));
+  return this.value;
+}`;
+
+async function fillElement(cdp, sid, target, value) {
+  const parsed = parseSelectorOrRef(target);
+  if (parsed.ref) return callOnRef(cdp, sid, parsed.ref, SET_VALUE, [value]);
+  return evaluate(cdp, sid, `(${SET_VALUE}).call(document.querySelector(${JSON.stringify(parsed.selector)}) ?? (() => { throw new Error('Element not found') })(), ${JSON.stringify(value)})`);
+}
+
+async function waitForDocument(cdp, sid, timeout) {
+  const deadline = Date.now() + timeout;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      if (await evaluate(cdp, sid, 'document.readyState') === 'complete') return;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(100);
+  }
+  throw new Error(`Navigation did not finish within ${timeout}ms${lastError ? `: ${lastError.message}` : ''}`);
+}
+
+async function waitFor(cdp, sid, kind, expected, timeout) {
+  if (!['text', 'selector'].includes(kind)) throw new Error('wait-for kind must be `text` or `selector`');
+  const condition = kind === 'text'
+    ? `document.body?.innerText.includes(${JSON.stringify(expected)})`
+    : `document.querySelector(${JSON.stringify(expected)})`;
+  const expression = `new Promise((resolve, reject) => {
+    const check = () => { if (${condition}) { observer.disconnect(); clearTimeout(timer); resolve(true); } };
+    const observer = new MutationObserver(check);
+    const timer = setTimeout(() => { observer.disconnect(); reject(new Error('wait-for timed out')); }, ${timeout});
+    observer.observe(document.documentElement, {subtree:true, childList:true, attributes:true, characterData:true});
+    check();
+  })`;
+  await evaluate(cdp, sid, expression, timeout + 1_000);
+  return `Found ${kind} ${JSON.stringify(expected)}`;
+}
+
+function keyDefinition(key) {
+  const named = {
+    Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
+    Tab: { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
+    Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
+    Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
+    ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
+    ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
+    ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
+    ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
+  };
+  return named[key] || { key, text: key, code: `Key${key.toUpperCase()}`, windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0) };
+}
+
+function stateId(endpoint, headers) {
+  return createHash('sha256').update(endpoint).update('\0').update(JSON.stringify(headers)).digest('hex').slice(0, 16);
+}
+
+function statePath(id) { return join(tmpdir(), `${STATE_PREFIX}${id}.json`); }
+function configPath(id) { return join(tmpdir(), `${STATE_PREFIX}${id}.config.json`); }
+
+function readState(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+function connectDaemon(state) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: '127.0.0.1', port: state.port });
+    socket.once('connect', () => resolve(socket));
+    socket.once('error', reject);
+  });
+}
+
+function daemonRequest(socket, state, command) {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk;
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      const response = JSON.parse(buffer.slice(0, newline));
+      socket.end();
+      if (response.ok) resolve(response.result);
+      else reject(new Error(response.error));
+    });
+    socket.once('error', reject);
+    socket.write(`${JSON.stringify({ token: state.token, ...command })}\n`);
+  });
+}
+
+async function daemonFor(endpoint, options) {
+  const id = stateId(endpoint, options.headers);
+  const path = statePath(id);
+  let state = readState(path);
+  if (state) {
+    try {
+      const socket = await connectDaemon(state);
+      return { socket, state };
+    } catch { try { unlinkSync(path); } catch {} }
+  }
+
+  const config = { endpoint, headers: options.headers, timeout: options.timeout, id };
+  const daemonConfigPath = configPath(id);
+  writeFileSync(daemonConfigPath, JSON.stringify(config), { mode: 0o600 });
+  const child = spawn(process.execPath, [SCRIPT, '_daemon', id], { detached: true, stdio: 'ignore' });
+  child.unref();
+  for (let attempt = 0; attempt < 50; attempt++) {
+    await sleep(200);
+    state = readState(path);
+    if (!state) continue;
+    try {
+      const socket = await connectDaemon(state);
+      return { socket, state };
+    } catch {}
+  }
+  throw new Error('CDP daemon failed to start. Grant Chrome debugging access if prompted, then retry.');
+}
+
+async function runDaemon(id) {
+  const daemonConfigPath = configPath(id);
+  const config = JSON.parse(readFileSync(daemonConfigPath, 'utf8'));
+  try { unlinkSync(daemonConfigPath); } catch {}
+  const path = statePath(config.id);
+  const token = randomBytes(24).toString('hex');
+  const cdp = new CDP(config.timeout);
+  await cdp.connect(config.endpoint, config.headers);
+  const sessions = new Map();
+  const consoleMessages = new Map();
+  const failedRequests = new Map();
+  const activeRequests = new Map();
+  let closing = false;
+  let idleTimer;
+
+  async function sessionFor(targetId) {
+    if (sessions.has(targetId)) return sessions.get(targetId);
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    sessions.set(targetId, sessionId);
+    consoleMessages.set(sessionId, []);
+    failedRequests.set(sessionId, []);
+    activeRequests.set(sessionId, new Map());
+    await Promise.all([
+      cdp.send('Runtime.enable', {}, sessionId),
+      cdp.send('Page.enable', {}, sessionId),
+      cdp.send('DOM.enable', {}, sessionId),
+      cdp.send('Network.enable', {}, sessionId),
+      cdp.send('Log.enable', {}, sessionId),
+    ]);
+    return sessionId;
+  }
+
+  cdp.on('Runtime.consoleAPICalled', (params, message) => {
+    const list = consoleMessages.get(message.sessionId);
+    if (!list) return;
+    const values = params.args.map(arg => arg.value ?? arg.description ?? arg.type);
+    list.push({ type: params.type, text: values.join(' '), timestamp: params.timestamp });
+    if (list.length > 200) list.shift();
+  });
+  cdp.on('Log.entryAdded', (params, message) => {
+    const list = consoleMessages.get(message.sessionId);
+    if (!list) return;
+    list.push({ type: params.entry.level, text: params.entry.text, source: params.entry.source });
+    if (list.length > 200) list.shift();
+  });
+  cdp.on('Network.requestWillBeSent', (params, message) => {
+    activeRequests.get(message.sessionId)?.set(params.requestId, {
+      url: params.request.url,
+      method: params.request.method,
+    });
+  });
+  cdp.on('Network.loadingFinished', (params, message) => {
+    activeRequests.get(message.sessionId)?.delete(params.requestId);
+  });
+  cdp.on('Network.loadingFailed', (params, message) => {
+    const list = failedRequests.get(message.sessionId);
+    if (!list) return;
+    const request = activeRequests.get(message.sessionId)?.get(params.requestId) || {};
+    activeRequests.get(message.sessionId)?.delete(params.requestId);
+    list.push({ ...request, errorText: params.errorText, canceled: params.canceled, type: params.type });
+    if (list.length > 200) list.shift();
+  });
+  cdp.on('Target.detachedFromTarget', ({ sessionId, targetId }) => {
+    sessions.delete(targetId);
+    consoleMessages.delete(sessionId);
+    failedRequests.delete(sessionId);
+    activeRequests.delete(sessionId);
+  });
+
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    clearTimeout(idleTimer);
+    server.close();
+    try { unlinkSync(path); } catch {}
+    cdp.close();
+  };
+  const resetIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+  };
+  cdp.onClose(shutdown);
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  async function execute(command, args) {
+    if (command === 'list') return formatPages(await pages(cdp));
+    if (command === 'stop') return { stop: true, output: '' };
+    const target = resolveTarget(args[0], await pages(cdp));
+    const sid = await sessionFor(target.targetId);
+    const rest = args.slice(1);
+
+    if (command === 'snapshot' || command === 'snap') {
+      const { nodes } = await cdp.send('Accessibility.getFullAXTree', {}, sid);
+      return formatSnapshot(nodes);
+    }
+    if (command === 'evaluate' || command === 'eval') return evaluate(cdp, sid, rest.join(' '), config.timeout);
+    if (command === 'html') return evaluate(cdp, sid, rest[0] ? `document.querySelector(${JSON.stringify(rest[0])})?.outerHTML ?? 'Element not found'` : 'document.documentElement.outerHTML');
+    if (command === 'navigate' || command === 'nav') {
+      if (!rest[0]) throw new Error('navigate requires a URL');
+      const navigationTimeout = rest[1] ? positiveInteger(rest[1], 'navigation timeout') : config.timeout;
+      const loaded = cdp.waitForEvent('Page.loadEventFired', sid, navigationTimeout);
+      let result;
+      try {
+        result = await cdp.send('Page.navigate', { url: rest[0] }, sid, navigationTimeout);
+      } catch (error) {
+        loaded.cancel();
+        throw error;
+      }
+      if (result.errorText) {
+        loaded.cancel();
+        throw new Error(result.errorText);
+      }
+      if (result.loaderId) await loaded.promise;
+      else loaded.cancel();
+      await waitForDocument(cdp, sid, navigationTimeout);
+      return `Navigated to ${rest[0]}`;
+    }
+    if (command === 'click') {
+      const result = await clickElement(cdp, sid, rest[0]);
+      return `Clicked ${result}`;
+    }
+    if (command === 'fill') {
+      const value = await fillElement(cdp, sid, rest[0], rest.slice(1).join(' '));
+      return `Filled element with ${JSON.stringify(value)}`;
+    }
+    if (command === 'type') {
+      await cdp.send('Input.insertText', { text: rest.join(' ') }, sid);
+      return `Typed ${rest.join(' ').length} characters`;
+    }
+    if (command === 'press') {
+      const key = keyDefinition(rest[0]);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...key }, sid);
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key, text: undefined }, sid);
+      return `Pressed ${rest[0]}`;
+    }
+    if (command === 'wait-for') {
+      const waitTimeout = rest[2] ? positiveInteger(rest[2], 'wait timeout') : config.timeout;
+      return waitFor(cdp, sid, rest[0], rest[1], waitTimeout);
+    }
+    if (command === 'screenshot' || command === 'shot') {
+      const screenshot = parseScreenshotArgs(rest);
+      const params = { format: screenshot.format, captureBeyondViewport: screenshot.fullPage };
+      if (screenshot.format !== 'png') params.quality = screenshot.quality;
+      if (screenshot.fullPage) {
+        const { contentSize } = await cdp.send('Page.getLayoutMetrics', {}, sid);
+        params.clip = { x: 0, y: 0, width: contentSize.width, height: contentSize.height, scale: 1 };
+      }
+      const { data } = await cdp.send('Page.captureScreenshot', params, sid, Math.max(config.timeout, 30_000));
+      const bytes = Buffer.from(data, 'base64');
+      writeFileSync(screenshot.path, bytes);
+      return `${screenshot.path}\nSaved ${(bytes.length / 1024).toFixed(1)} KiB ${screenshot.format.toUpperCase()} screenshot.`;
+    }
+    if (command === 'console') return JSON.stringify(consoleMessages.get(sid) || [], null, 2);
+    if (command === 'failures') return JSON.stringify(failedRequests.get(sid) || [], null, 2);
+    if (command === 'raw') {
+      const params = rest[1] ? JSON.parse(rest.slice(1).join(' ')) : {};
+      return JSON.stringify(await cdp.send(rest[0], params, sid), null, 2);
+    }
+    throw new Error(`Unknown command: ${command}`);
+  }
+
+  const server = net.createServer(socket => {
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk;
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      let request;
+      try { request = JSON.parse(buffer.slice(0, newline)); }
+      catch { socket.end(`${JSON.stringify({ ok: false, error: 'Invalid request' })}\n`); return; }
+      if (request.token !== token) { socket.end(`${JSON.stringify({ ok: false, error: 'Unauthorized' })}\n`); return; }
+      resetIdle();
+      execute(request.command, request.args || []).then(result => {
+        const stop = typeof result === 'object' && result.stop;
+        const output = stop ? result.output : result;
+        socket.end(`${JSON.stringify({ ok: true, result: output ?? '' })}\n`, stop ? shutdown : undefined);
+      }).catch(error => socket.end(`${JSON.stringify({ ok: false, error: error.message })}\n`));
+    });
+  });
+  server.listen(0, '127.0.0.1', () => {
+    const state = { port: server.address().port, token, pid: process.pid };
+    writeFileSync(path, JSON.stringify(state), { mode: 0o600 });
+    resetIdle();
+  });
+}
+
+function parseScreenshotArgs(args) {
+  let path;
+  let format = 'jpeg';
+  let quality = 75;
+  let fullPage = false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--format') format = args[++i];
+    else if (args[i] === '--quality') quality = positiveInteger(args[++i], '--quality');
+    else if (args[i] === '--full-page') fullPage = true;
+    else if (!path) path = resolve(args[i]);
+    else throw new Error(`Unexpected screenshot argument: ${args[i]}`);
+  }
+  if (!['jpeg', 'webp', 'png'].includes(format)) throw new Error('--format must be jpeg, webp, or png');
+  if (quality > 100) throw new Error('--quality must be at most 100');
+  path ||= resolve(tmpdir(), `screenshot.${format === 'jpeg' ? 'jpg' : format}`);
+  mkdirSync(dirname(path), { recursive: true });
+  return { path, format, quality, fullPage };
+}
+
+const USAGE = `cdp ${VERSION} — direct Chrome DevTools Protocol CLI (Node.js 22+, no dependencies)
+
+Usage: node scripts/cdp.mjs [connection options] <command> [arguments]
+
+Connection options:
+  --ws-endpoint <ws://...>       Browser CDP WebSocket endpoint
+  --http-endpoint <http://...>   Discover endpoint through /json/version
+  --headers <json>               Headers for HTTP and WebSocket connections
+  --timeout <ms>                 Command timeout (default: 15000)
+
+The same values can be set with CDP_WS_ENDPOINT, CDP_HTTP_ENDPOINT, and
+CDP_HEADERS. With no endpoint, the CLI discovers a local Chrome instance.
+
+Commands:
+  list
+  snapshot <target>
+  screenshot <target> [file] [--format jpeg|webp|png] [--quality 75] [--full-page]
+  navigate <target> <url> [timeout-ms]
+  evaluate <target> <expression>
+  html <target> [selector]
+  click <target> <selector|ref:123>
+  fill <target> <selector|ref:123> <value>
+  type <target> <text>
+  press <target> <key>
+  wait-for <target> <text|selector> <value> [timeout-ms]
+  console <target>
+  failures <target>
+  raw <target> <CDP.method> [json-params]
+  stop
+
+Targets are unique ID prefixes shown by list. snapshot prints stable ref values
+for elements; pass one as ref:123 to click or fill. A background daemon keeps the
+Chrome connection alive for 20 minutes so browser approval is only needed once.`;
+
+async function main() {
+  const { options, args } = parseOptions(process.argv.slice(2));
+  if (args[0] === '_daemon') return runDaemon(args[1]);
+  if (options.version) { console.log(VERSION); return; }
+  if (options.help || !args.length) { console.log(USAGE); return; }
+
+  const [command, ...commandArgs] = args;
+  const supported = new Set(['list', 'snapshot', 'snap', 'screenshot', 'shot', 'navigate', 'nav', 'evaluate', 'eval', 'html', 'click', 'fill', 'type', 'press', 'wait-for', 'console', 'failures', 'raw', 'stop']);
+  if (!supported.has(command)) throw new Error(`Unknown command: ${command}\n\n${USAGE}`);
+  const endpoint = await resolveEndpoint(options);
+  if (command === 'stop') {
+    const state = readState(statePath(stateId(endpoint, options.headers)));
+    if (!state) return;
+    try {
+      const socket = await connectDaemon(state);
+      await daemonRequest(socket, state, { command: 'stop', args: [] });
+    } catch {
+      try { unlinkSync(statePath(stateId(endpoint, options.headers))); } catch {}
+    }
+    return;
+  }
+  const { socket, state } = await daemonFor(endpoint, options);
+  const result = await daemonRequest(socket, state, { command, args: commandArgs });
+  if (result) console.log(result);
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT)) {
+  main().catch(error => { console.error(`Error: ${error.message}`); process.exit(1); });
+}
+
+export { formatPages, formatSnapshot, parseOptions, parseScreenshotArgs, resolveTarget, uniquePrefixLength };

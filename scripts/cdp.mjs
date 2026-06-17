@@ -2,7 +2,7 @@
 // Dependency-free Chrome DevTools Protocol CLI for Node.js 22+.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, platform, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -385,15 +385,53 @@ function keyDefinition(key) {
   return named[key] || { key, text: key, code: `Key${key.toUpperCase()}`, windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0) };
 }
 
-function stateId(endpoint, headers) {
-  return createHash('sha256').update(endpoint).update('\0').update(JSON.stringify(headers)).digest('hex').slice(0, 16);
+function normalizeHttpEndpoint(endpoint) {
+  return endpoint.replace(/\/$/, '');
 }
 
-function statePath(id) { return join(tmpdir(), `${STATE_PREFIX}${id}.json`); }
-function configPath(id) { return join(tmpdir(), `${STATE_PREFIX}${id}.config.json`); }
+function connectionIdentity(options, resolvedEndpoint) {
+  if (options.wsEndpoint) return `ws:${options.wsEndpoint}`;
+  if (options.httpEndpoint) return `http:${normalizeHttpEndpoint(options.httpEndpoint)}`;
+  return `auto:${resolvedEndpoint}`;
+}
+
+function stateId(identity, headers) {
+  return createHash('sha256').update(identity).update('\0').update(JSON.stringify(headers)).digest('hex').slice(0, 16);
+}
+
+function safeConnectionLabel(options) {
+  const endpoint = options.wsEndpoint || options.httpEndpoint;
+  if (!endpoint) return 'auto-discovered Chrome';
+  try {
+    const url = new URL(endpoint);
+    return `${options.wsEndpoint ? 'WebSocket' : 'HTTP'} ${url.protocol}//${url.host}`;
+  } catch {
+    return options.wsEndpoint ? 'explicit WebSocket endpoint' : 'explicit HTTP endpoint';
+  }
+}
+
+function stateDirectory() {
+  const directory = process.env.CDP_STATE_DIR || tmpdir();
+  if (process.env.CDP_STATE_DIR) mkdirSync(directory, { recursive: true, mode: 0o700 });
+  return directory;
+}
+
+function statePath(id) { return join(stateDirectory(), `${STATE_PREFIX}${id}.json`); }
+function configPath(id) { return join(stateDirectory(), `${STATE_PREFIX}${id}.config.json`); }
 
 function readState(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+function daemonStates() {
+  const pattern = new RegExp(`^${STATE_PREFIX}([a-f0-9]{16})\\.json$`);
+  return readdirSync(stateDirectory(), { withFileTypes: true }).flatMap(entry => {
+    const match = entry.isFile() && entry.name.match(pattern);
+    if (!match) return [];
+    const path = join(stateDirectory(), entry.name);
+    const state = readState(path);
+    return state ? [{ id: match[1], path, state }] : [];
+  });
 }
 
 function connectDaemon(state) {
@@ -422,7 +460,8 @@ function daemonRequest(socket, state, command) {
 }
 
 async function daemonFor(endpoint, options) {
-  const id = stateId(endpoint, options.headers);
+  const identity = connectionIdentity(options, endpoint);
+  const id = stateId(identity, options.headers);
   const path = statePath(id);
   let state = readState(path);
   if (state) {
@@ -432,7 +471,13 @@ async function daemonFor(endpoint, options) {
     } catch { try { unlinkSync(path); } catch {} }
   }
 
-  const config = { endpoint, headers: options.headers, timeout: options.timeout, id };
+  const config = {
+    endpoint,
+    headers: options.headers,
+    timeout: options.timeout,
+    id,
+    label: safeConnectionLabel(options),
+  };
   const daemonConfigPath = configPath(id);
   writeFileSync(daemonConfigPath, JSON.stringify(config), { mode: 0o600 });
   const child = spawn(process.execPath, [SCRIPT, '_daemon', id], { detached: true, stdio: 'ignore' });
@@ -630,10 +675,74 @@ async function runDaemon(id) {
     });
   });
   server.listen(0, '127.0.0.1', () => {
-    const state = { port: server.address().port, token, pid: process.pid };
+    const state = {
+      id: config.id,
+      label: config.label,
+      port: server.address().port,
+      token,
+      pid: process.pid,
+    };
     writeFileSync(path, JSON.stringify(state), { mode: 0o600 });
     resetIdle();
   });
+}
+
+function parseStopArgs(args, options) {
+  let all = false;
+  let id;
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === '--all') all = true;
+    else if (args[index] === '--id') {
+      id = args[++index];
+      if (!id) throw new Error('stop --id requires a daemon id');
+    } else throw new Error(`Unknown stop option: ${args[index]}`);
+  }
+  if (id && !/^[a-f0-9]{16}$/i.test(id)) throw new Error('--id must be a 16-character daemon id');
+  const explicitEndpoint = Boolean(options.wsEndpoint || options.httpEndpoint);
+  if (options.wsEndpoint && options.httpEndpoint) {
+    throw new Error('Choose either --ws-endpoint or --http-endpoint, not both');
+  }
+  if ([all, Boolean(id), explicitEndpoint].filter(Boolean).length > 1) {
+    throw new Error('Choose only one stop selector: an endpoint, --id, or --all');
+  }
+  return { all, id: id?.toLowerCase(), explicitEndpoint };
+}
+
+async function stopState(entry) {
+  try {
+    const socket = await connectDaemon(entry.state);
+    await daemonRequest(socket, entry.state, { command: 'stop', args: [] });
+    return `Stopped ${entry.id} (${entry.state.label || 'unknown endpoint'}).`;
+  } catch {
+    try { unlinkSync(entry.path); } catch {}
+    return `Removed stale daemon state ${entry.id} (${entry.state.label || 'unknown endpoint'}).`;
+  }
+}
+
+async function stopDaemons(args, options) {
+  const selector = parseStopArgs(args, options);
+  const states = daemonStates();
+  let selected;
+
+  if (selector.explicitEndpoint) {
+    const identity = connectionIdentity(options);
+    const id = stateId(identity, options.headers);
+    selected = states.filter(entry => entry.id === id);
+  } else if (selector.id) {
+    selected = states.filter(entry => entry.id === selector.id);
+  } else if (selector.all) {
+    selected = states;
+  } else if (states.length === 1) {
+    selected = states;
+  } else if (states.length === 0) {
+    return 'No CDP daemons are running.';
+  } else {
+    const choices = states.map(entry => `  ${entry.id}  ${entry.state.label || 'unknown endpoint'}`).join('\n');
+    throw new Error(`Multiple CDP daemons are running. Use stop --id <id> or stop --all:\n${choices}`);
+  }
+
+  if (!selected.length) return 'No matching CDP daemon is running.';
+  return (await Promise.all(selected.map(stopState))).join('\n');
 }
 
 function parseScreenshotArgs(args) {
@@ -683,7 +792,10 @@ Commands:
   console <target>
   failures <target>
   raw <target> <CDP.method> [json-params]
-  stop
+  stop [--id <daemon-id> | --all]
+
+With an explicit --ws-endpoint or --http-endpoint, stop targets only that daemon.
+With no selector, it stops the only daemon and refuses if multiple are running.
 
 Targets are unique ID prefixes shown by list. snapshot prints stable ref values
 for elements; pass one as ref:123 to click or fill. A background daemon keeps the
@@ -698,18 +810,11 @@ async function main() {
   const [command, ...commandArgs] = args;
   const supported = new Set(['list', 'snapshot', 'snap', 'screenshot', 'shot', 'navigate', 'nav', 'evaluate', 'eval', 'html', 'click', 'fill', 'type', 'press', 'wait-for', 'console', 'failures', 'raw', 'stop']);
   if (!supported.has(command)) throw new Error(`Unknown command: ${command}\n\n${USAGE}`);
-  const endpoint = await resolveEndpoint(options);
   if (command === 'stop') {
-    const state = readState(statePath(stateId(endpoint, options.headers)));
-    if (!state) return;
-    try {
-      const socket = await connectDaemon(state);
-      await daemonRequest(socket, state, { command: 'stop', args: [] });
-    } catch {
-      try { unlinkSync(statePath(stateId(endpoint, options.headers))); } catch {}
-    }
+    console.log(await stopDaemons(commandArgs, options));
     return;
   }
+  const endpoint = await resolveEndpoint(options);
   const { socket, state } = await daemonFor(endpoint, options);
   const result = await daemonRequest(socket, state, { command, args: commandArgs });
   if (result) console.log(result);

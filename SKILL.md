@@ -74,8 +74,22 @@ last command. This avoids repeated connection setup and repeated Chrome approval
 prompts. Stop it explicitly when finished:
 
 ```sh
+# Stops the daemon when exactly one is running; no browser discovery is needed
 node <skill-directory>/scripts/cdp.mjs stop
+
+# Select one when several endpoints have active daemons
+node <skill-directory>/scripts/cdp.mjs stop --id <daemon-id>
+
+# Stop only the daemon created for this endpoint, without reconnecting to it
+node <skill-directory>/scripts/cdp.mjs \
+  --ws-endpoint 'wss://browser.example/devtools/browser/...' stop
+
+# Deliberately stop every daemon
+node <skill-directory>/scripts/cdp.mjs stop --all
 ```
+
+Plain `stop` refuses if multiple daemons are active and prints their safe IDs and
+hosts. It never prints endpoint query strings or authentication headers.
 
 ## Canonical interaction loop
 
@@ -125,7 +139,7 @@ wait-for <target> <text|selector> <value> [timeout-ms]
 console <target>
 failures <target>
 raw <target> <CDP.method> [json-params]
-stop
+stop [--id <daemon-id> | --all]
 ```
 
 Global options must precede the command:

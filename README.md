@@ -72,6 +72,12 @@ Its random authentication token and connection details are stored in an
 owner-readable temporary state file. This avoids repeated Chrome access prompts
 without exposing the daemon on the network.
 
+Stop the sole active daemon with `node scripts/cdp.mjs stop`. If several are
+running, the CLI lists safe daemon IDs and requires `stop --id <id>` or the
+explicit `stop --all`. An endpoint-specific stop can be selected with
+`--ws-endpoint` or `--http-endpoint`; cleanup never needs to reconnect to or
+rediscover the browser.
+
 ## Development
 
 ```sh

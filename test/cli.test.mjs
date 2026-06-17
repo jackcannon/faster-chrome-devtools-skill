@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { after, before, test } from 'node:test';
 import { promisify } from 'node:util';
 
@@ -52,9 +54,24 @@ function decodeFrame(buffer) {
 
 let browserServer;
 let endpoint;
+let stateDirectory;
 const seenMethods = [];
 
+function runCli(args, overrides = {}) {
+  return execFileAsync(process.execPath, [cli, ...args], {
+    env: {
+      ...process.env,
+      CDP_STATE_DIR: stateDirectory,
+      CDP_WS_ENDPOINT: '',
+      CDP_HTTP_ENDPOINT: '',
+      CDP_HEADERS: '',
+      ...overrides,
+    },
+  });
+}
+
 before(async () => {
+  stateDirectory = mkdtempSync(join(tmpdir(), 'faster-cdp-test-'));
   browserServer = http.createServer();
   browserServer.on('upgrade', (request, socket) => {
     const accept = createHash('sha1')
@@ -113,30 +130,81 @@ before(async () => {
     });
   });
   await new Promise(resolveListen => browserServer.listen(0, '127.0.0.1', resolveListen));
-  endpoint = `ws://127.0.0.1:${browserServer.address().port}/devtools/browser/mock`;
+  endpoint = `ws://127.0.0.1:${browserServer.address().port}/devtools/browser/mock?token=not-for-output`;
 });
 
 after(async () => {
-  try { await execFileAsync(process.execPath, [cli, '--ws-endpoint', endpoint, 'stop']); } catch {}
+  try { await runCli(['stop', '--all']); } catch {}
   await new Promise(resolveClose => browserServer.close(resolveClose));
+  rmSync(stateDirectory, { recursive: true, force: true });
 });
 
 test('CLI connects directly, lists targets, and reuses its daemon', async () => {
-  const first = await execFileAsync(process.execPath, [cli, '--ws-endpoint', endpoint, 'list']);
+  const first = await runCli(['--ws-endpoint', endpoint, 'list']);
   assert.match(first.stdout, /^ABCDEF01\s+Mock Browser Page/m);
 
-  const second = await execFileAsync(process.execPath, [cli, '--ws-endpoint', endpoint, 'list']);
+  const second = await runCli(['--ws-endpoint', endpoint, 'list']);
   assert.equal(second.stdout, first.stdout);
+  const [daemonState] = readdirSync(stateDirectory);
+  assert.equal(statSync(join(stateDirectory, daemonState)).mode & 0o777, 0o600);
 
-  const snapshot = await execFileAsync(process.execPath, [
-    cli, '--ws-endpoint', endpoint, 'snapshot', 'ABCDEF01',
+  const snapshot = await runCli([
+    '--ws-endpoint', endpoint, 'snapshot', 'ABCDEF01',
   ]);
   assert.match(snapshot.stdout, /\[button ref=42\] "Submit"/);
 
-  const click = await execFileAsync(process.execPath, [
-    cli, '--ws-endpoint', endpoint, 'click', 'ABCDEF01', 'ref:42',
+  const click = await runCli([
+    '--ws-endpoint', endpoint, 'click', 'ABCDEF01', 'ref:42',
   ]);
   assert.match(click.stdout, /Clicked element at \(20, 30\)/);
   assert.equal(seenMethods.filter(method => method === 'Target.attachToTarget').length, 1);
   assert.equal(seenMethods.filter(method => method === 'Input.dispatchMouseEvent').length, 3);
+
+  const stoppedWithoutDiscovery = await runCli(['stop']);
+  assert.match(stoppedWithoutDiscovery.stdout, /^Stopped [a-f0-9]{16} \(WebSocket ws:\/\/127\.0\.0\.1:/);
+  assert.doesNotMatch(stoppedWithoutDiscovery.stdout, /not-for-output/);
+  assert.deepEqual(readdirSync(stateDirectory), []);
+
+  writeFileSync(join(stateDirectory, 'faster-cdp-1111111111111111.json'), JSON.stringify({
+    id: '1111111111111111', label: 'WebSocket ws://one.test', port: 1, token: 'one',
+  }));
+  writeFileSync(join(stateDirectory, 'faster-cdp-2222222222222222.json'), JSON.stringify({
+    id: '2222222222222222', label: 'HTTP https://two.test', port: 2, token: 'two',
+  }));
+  await assert.rejects(runCli(['stop']), error => {
+    assert.match(error.stderr, /Multiple CDP daemons are running/);
+    assert.match(error.stderr, /1111111111111111  WebSocket ws:\/\/one\.test/);
+    assert.match(error.stderr, /2222222222222222  HTTP https:\/\/two\.test/);
+    return true;
+  });
+  const selectedStop = await runCli(['stop', '--id', '1111111111111111']);
+  assert.match(selectedStop.stdout, /Removed stale daemon state 1111111111111111/);
+  assert.deepEqual(readdirSync(stateDirectory), ['faster-cdp-2222222222222222.json']);
+  writeFileSync(join(stateDirectory, 'faster-cdp-3333333333333333.json'), JSON.stringify({
+    id: '3333333333333333', label: 'HTTP https://three.test', port: 3, token: 'three',
+  }));
+  const allStop = await runCli(['stop', '--all']);
+  assert.match(allStop.stdout, /Removed stale daemon state 2222222222222222/);
+  assert.match(allStop.stdout, /Removed stale daemon state 3333333333333333/);
+  assert.deepEqual(readdirSync(stateDirectory), []);
+
+  await runCli(['--ws-endpoint', endpoint, 'list']);
+  const explicitStop = await runCli(['--ws-endpoint', endpoint, 'stop']);
+  assert.match(explicitStop.stdout, /^Stopped [a-f0-9]{16}/);
+});
+
+test('HTTP-specific stop does not rediscover an unavailable endpoint', async () => {
+  const discovery = http.createServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ webSocketDebuggerUrl: endpoint }));
+  });
+  await new Promise(resolveListen => discovery.listen(0, '127.0.0.1', resolveListen));
+  const httpEndpoint = `http://127.0.0.1:${discovery.address().port}`;
+
+  await runCli(['--http-endpoint', httpEndpoint, 'list']);
+  await new Promise(resolveClose => discovery.close(resolveClose));
+
+  const stopped = await runCli(['--http-endpoint', httpEndpoint, 'stop']);
+  assert.match(stopped.stdout, /^Stopped [a-f0-9]{16} \(HTTP http:\/\/127\.0\.0\.1:/);
+  assert.deepEqual(readdirSync(stateDirectory), []);
 });

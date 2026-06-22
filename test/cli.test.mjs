@@ -6,6 +6,7 @@ import {
 	readdirSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import http from "node:http";
@@ -308,4 +309,19 @@ test("HTTP-specific stop does not rediscover an unavailable endpoint", async () 
 		/^Stopped [a-f0-9]{16} \(HTTP http:\/\/127\.0\.0\.1:/,
 	);
 	assert.deepEqual(readdirSync(stateDirectory), []);
+});
+
+test("runs main when invoked through a symlinked path", async () => {
+	const linkDir = mkdtempSync(join(tmpdir(), "faster-cdp-symlink-"));
+	const link = join(linkDir, "cdp.mjs");
+	symlinkSync(cli, link);
+	try {
+		const { stdout } = await execFileAsync(process.execPath, [
+			link,
+			"--version",
+		]);
+		assert.equal(stdout.trim(), "0.1.0");
+	} finally {
+		rmSync(linkDir, { recursive: true, force: true });
+	}
 });

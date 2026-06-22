@@ -9,6 +9,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -1170,7 +1171,20 @@ async function main() {
 	if (result) console.log(result);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT)) {
+function isMainModule() {
+	const entry = process.argv[1];
+	if (!entry) return false;
+	try {
+		// Compare real paths: Node dereferences symlinks for import.meta.url but
+		// not for process.argv[1], so a symlinked install (e.g. a skills dir)
+		// would otherwise fail this guard and never run main().
+		return realpathSync(entry) === realpathSync(SCRIPT);
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
 	main().catch((error) => {
 		console.error(`Error: ${error.message}`);
 		process.exit(1);

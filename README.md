@@ -8,15 +8,6 @@ DevTools MCP, Puppeteer, or Playwright.
 
 ![HIC LIMAX NAVIGAT LENTE](images/chrome-snail-09.jpg)
 
-## Install
-
-```sh
-npx skills add zeke/faster-chrome-devtools-skill --global --all --yes
-```
-
-Node.js 22 or later is required. For local browser access, enable remote
-debugging in Chrome at `chrome://inspect/#remote-debugging`.
-
 ## Capabilities
 
 - List, open, and reuse tabs
@@ -31,42 +22,21 @@ debugging in Chrome at `chrome://inspect/#remote-debugging`.
 - Connect to authenticated remote browser endpoints
 - Keep the connection alive in a lightweight background daemon
 
-Run `node scripts/cdp.mjs --help` for the complete command reference. Agent usage
-patterns, screenshot safety, debugging guidance, and remote-browser notes live in
-[`SKILL.md`](SKILL.md).
+## Install
+
+```sh
+npx skills add zeke/faster-chrome-devtools-skill --global --all --yes
+```
+
+Node.js 22 or later is required. For local browser access, enable remote
+debugging in Chrome at `chrome://inspect/#remote-debugging`.
 
 ## Try it
 
-Once installed, ask your coding agent to drive Chrome. Paste a prompt like this
-into your agent:
+Once installed, paste a prompt like this into your coding agent:
 
 ```text
-Take a screenshot of https://example.com and describe what is on the page.
-```
-
-The agent loads this skill and runs the bundled CLI for you. You can also run the
-CLI directly:
-
-```sh
-node scripts/cdp.mjs list
-node scripts/cdp.mjs snapshot <target>
-node scripts/cdp.mjs screenshot <target> /tmp/page.jpg
-```
-
-The CLI automatically discovers Chrome on macOS, Windows, and common Linux
-installations. Explicit local or remote endpoints are also supported:
-
-```sh
-node scripts/cdp.mjs --http-endpoint http://127.0.0.1:9222 list
-node scripts/cdp.mjs --ws-endpoint 'wss://example.test/devtools/browser/...' list
-```
-
-Authenticated endpoints can receive arbitrary upgrade headers:
-
-```sh
-export CDP_WS_ENDPOINT='wss://example.test/devtools/browser/...'
-export CDP_HEADERS='{"Authorization":"Bearer ..."}'
-node scripts/cdp.mjs list
+Using my local Chrome, open https://news.ycombinator.com, take a screenshot, and list the top five story titles from the page.
 ```
 
 ## Design

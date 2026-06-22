@@ -6,6 +6,7 @@ description: >
   clicking, form input, console errors, failed requests, or JavaScript
   evaluation. Uses a dependency-free Node.js CLI over WebSocket; Chrome
   DevTools MCP, Puppeteer, and Playwright are not required.
+compatibility: Requires Node.js 22+
 ---
 
 # Faster Chrome DevTools: direct CDP

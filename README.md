@@ -72,6 +72,26 @@ explicit `stop --all`. An endpoint-specific stop can be selected with
 `--ws-endpoint` or `--http-endpoint`; cleanup never needs to reconnect to or
 rediscover the browser.
 
+## Why a CLI instead of MCP?
+
+Google's [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp)
+is still great and this skill began as a guide for using it, but using a CLI
+instead has some key advantages:
+
+- Works anywhere. Any agent that supports Agent Skills and can run a shell can use
+  it, with no MCP server to configure.
+- Full CDP protocol. MCP offers a fixed set of high-level tools plus JavaScript
+  evaluation; the CLI's `raw` command can call any Chrome DevTools method.
+- Leaner context. The MCP server advertises dozens of tools to the model for the
+  whole session. This skill loads only its description until used, then runs
+  through the shell tool your agent already has.
+- No screenshot bloat. MCP returns screenshots inline to the model, which is why
+  large ones can be silently dropped or even break a session. The CLI writes
+  images to a file and returns the path, so the bytes enter the model only if you
+  ask for them.
+
+To set up MCP instead, see [Browsers in the cloud](https://zeke.sikelianos.com/browsers-in-the-cloud/).
+
 ## Development
 
 See [AGENTS.md](AGENTS.md)

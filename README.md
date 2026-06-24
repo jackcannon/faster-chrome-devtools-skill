@@ -60,7 +60,8 @@ such as WebMCP are available when the remote browser supports them.
 
 ## Design
 
-The CLI is implemented entirely with Node.js built-ins. `scripts/lib/websocket.mjs`
+The installable skill lives in `skills/faster-chrome-devtools-skill/`. The CLI is
+implemented entirely with Node.js built-ins. Its `scripts/lib/websocket.mjs`
 contains the small RFC 6455 client used to support custom HTTP upgrade headers,
 which Node's browser-compatible global `WebSocket` API does not expose.
 
@@ -69,7 +70,8 @@ Its random authentication token and connection details are stored in an
 owner-readable temporary state file. This avoids repeated Chrome access prompts
 without exposing the daemon on the network.
 
-Stop the sole active daemon with `node scripts/cdp.mjs stop`. If several are
+Stop the sole active daemon with
+`node skills/faster-chrome-devtools-skill/scripts/cdp.mjs stop`. If several are
 running, the CLI lists safe daemon IDs and requires `stop --id <id>` or the
 explicit `stop --all`. An endpoint-specific stop can be selected with
 `--ws-endpoint` or `--http-endpoint`; cleanup never needs to reconnect to or

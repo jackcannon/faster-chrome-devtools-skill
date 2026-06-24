@@ -1,7 +1,8 @@
 ## About this project
 
 This repo is a published, shareable agent skill and dependency-free Node.js CLI
-for direct Chrome DevTools Protocol usage. `SKILL.md` is the skill itself (for
+for direct Chrome DevTools Protocol usage. The installable payload lives in
+`skills/faster-chrome-devtools-skill/`: `SKILL.md` is the skill itself (for
 agents), `scripts/cdp.mjs` is the CLI, and `README.md` is for humans. The CLI
 must continue to work without Chrome DevTools MCP, Puppeteer, Playwright, or npm
 runtime dependencies.
@@ -9,8 +10,8 @@ runtime dependencies.
 ## Keep it portable
 
 This skill is used by many people with different setups. Anything written into
-`SKILL.md` must be generally relevant, not specific to one person's machine or
-config.
+`skills/faster-chrome-devtools-skill/SKILL.md` must be generally relevant, not
+specific to one person's machine or config.
 
 - Don't hardcode account IDs, absolute file paths, tokens, or personal CLI
   tools. Use generic placeholders where a value is required.

@@ -7,7 +7,7 @@ import {
 	parseScreenshotArgs,
 	resolveTarget,
 	uniquePrefixLength,
-} from "../scripts/cdp.mjs";
+} from "../skills/faster-chrome-devtools-skill/scripts/cdp.mjs";
 
 test("parseOptions accepts direct endpoint and headers", () => {
 	const { options, args } = parseOptions([

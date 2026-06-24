@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import http from "node:http";
 import { after, before, test } from "node:test";
-import { connectWebSocket } from "../scripts/lib/websocket.mjs";
+import { connectWebSocket } from "../skills/faster-chrome-devtools-skill/scripts/lib/websocket.mjs";
 
 function serverFrame(text) {
 	const payload = Buffer.from(text);

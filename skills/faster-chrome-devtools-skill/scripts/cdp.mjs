@@ -1084,7 +1084,7 @@ function parseScreenshotArgs(args) {
 
 const USAGE = `cdp ${VERSION} — direct Chrome DevTools Protocol CLI (Node.js 22+, no dependencies)
 
-Usage: node scripts/cdp.mjs [connection options] <command> [arguments]
+Usage: node <skill-directory>/scripts/cdp.mjs [connection options] <command> [arguments]
 
 Connection options:
   --ws-endpoint <ws://...>       Browser CDP WebSocket endpoint

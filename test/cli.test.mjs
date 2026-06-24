@@ -16,7 +16,7 @@ import { after, before, test } from "node:test";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const cli = resolve("scripts/cdp.mjs");
+const cli = resolve("skills/faster-chrome-devtools-skill/scripts/cdp.mjs");
 
 function encodeFrame(text) {
 	const payload = Buffer.from(text);

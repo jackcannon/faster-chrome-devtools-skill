@@ -363,9 +363,14 @@ or isolation from the user's real browser. Prefer local Chrome when you need the
 user's existing login state or are debugging the exact tab they are viewing.
 
 For a single stateless output inside a Cloudflare Worker—such as a screenshot,
-PDF, Markdown extraction, or scrape—prefer the Browser Rendering binding's
-`env.BROWSER.quickAction(...)`. Starting an interactive CDP session is more
-appropriate for multi-step navigation, page mutation, or debugging.
+PDF, Markdown extraction, scrape, or accessibility tree (`quickAction("accessibilityTree",
+...)`)—prefer the Browser Rendering binding's `env.BROWSER.quickAction(...)`.
+This returns a plain role/name/state tree with no interaction refs, so it fits
+a one-shot "describe this page's structure" call rather than a click-fill-wait
+loop. Starting an interactive CDP session is more appropriate for multi-step
+navigation, page mutation, or debugging; use this skill's own `snapshot`
+command there instead, since its accessibility tree includes stable `ref=123`
+handles for follow-up `click`/`fill` commands.
 
 ## Optional MCP compatibility
 

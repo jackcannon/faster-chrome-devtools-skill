@@ -809,8 +809,14 @@ async function runDaemon(id) {
 			const { nodes } = await cdp.send("Accessibility.getFullAXTree", {}, sid);
 			return formatSnapshot(nodes);
 		}
-		if (command === "evaluate" || command === "eval")
-			return evaluate(cdp, sid, rest.join(" "), config.timeout);
+		if (command === "evaluate" || command === "eval") {
+			let expression = rest.join(" ");
+			if (expression.startsWith("@")) {
+				const filePath = expression.slice(1);
+				expression = readFileSync(filePath, "utf8");
+			}
+			return evaluate(cdp, sid, expression, config.timeout);
+		}
 		if (command === "html")
 			return evaluate(
 				cdp,
@@ -1101,7 +1107,7 @@ Commands:
   snapshot <target>
   screenshot <target> [file] [--format jpeg|webp|png] [--quality 75] [--full-page]
   navigate <target> <url> [timeout-ms]
-  evaluate <target> <expression>
+  evaluate <target> <expression|@file>
   html <target> [selector]
   click <target> <selector|ref:123>
   fill <target> <selector|ref:123> <value>

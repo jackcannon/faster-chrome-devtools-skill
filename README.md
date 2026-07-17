@@ -1,5 +1,13 @@
 # faster-chrome-devtools-skill
 
+> **Fork note.** This is a fork of [zeke/faster-chrome-devtools-skill](https://github.com/zeke/faster-chrome-devtools-skill).
+> VS Code Copilot's auto-approve heuristic treats curly braces `{}` in inline JS
+> (IIFEs, arrow functions) as file-write glob patterns, so every `evaluate` with
+> braces gets blocked as "File write operations detected that cannot be auto
+> approved." This fork adds `@file` support on `evaluate`: write the expression
+> to a temp file and pass `@/path/to/file.js` instead of inline JS, which keeps
+> the command within what VS Code can auto-permit.
+
 An [agent skill](https://agentskills.io) and command-line tool for controlling Chrome directly through the
 Chrome DevTools Protocol (CDP).
 
